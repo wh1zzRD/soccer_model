@@ -1,3 +1,6 @@
+# Gradio
+.gradio/
+
 # Videos
 *.mp4
 *.avi
