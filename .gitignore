@@ -23,7 +23,6 @@ build/
 Thumbs.db
 
 # Models / large weights
-*.pt
 *.pth
 *.bin
 *.ckpt
