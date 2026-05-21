@@ -26,7 +26,6 @@ build/
 Thumbs.db
 
 # Models / large weights
-*.pth
 *.bin
 *.ckpt
 *.safetensors
