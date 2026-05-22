@@ -32,4 +32,12 @@ export GRADIO_SERVER_NAME="${GRADIO_SERVER_NAME:-0.0.0.0}"
 export GRADIO_SERVER_PORT="${GRADIO_SERVER_PORT:-7860}"
 export GRADIO_SHARE="${GRADIO_SHARE:-false}"
 
+default_crowd_audio="$PWD/crowd-cheering-clapping-at-stadium-gregor-quendel-1-00-30.mp3"
+if [[ -f "$default_crowd_audio" ]]; then
+  export SOCCER_MODEL_CROWD_AUDIO="${SOCCER_MODEL_CROWD_AUDIO:-$default_crowd_audio}"
+  export SOCCER_MODEL_CROWD_VOLUME="${SOCCER_MODEL_CROWD_VOLUME:-0.14}"
+  export SOCCER_MODEL_CROWD_OFFSET="${SOCCER_MODEL_CROWD_OFFSET:-0.75}"
+  export SOCCER_MODEL_COMMENTARY_VOLUME="${SOCCER_MODEL_COMMENTARY_VOLUME:-1.35}"
+fi
+
 python3 app.py
