@@ -33,7 +33,7 @@ export GRADIO_SERVER_PORT="${GRADIO_SERVER_PORT:-7860}"
 export GRADIO_SHARE="${GRADIO_SHARE:-false}"
 
 default_crowd_audio="$PWD/crowd-cheering-clapping-at-stadium-gregor-quendel-1-00-30.mp3"
-if [[ -f "$default_crowd_audio" ]]; then
+if [[ -f "$default_crowd_audio" && "$(wc -c < "$default_crowd_audio")" -gt 1024 ]]; then
   export SOCCER_MODEL_CROWD_AUDIO="${SOCCER_MODEL_CROWD_AUDIO:-$default_crowd_audio}"
   export SOCCER_MODEL_CROWD_VOLUME="${SOCCER_MODEL_CROWD_VOLUME:-0.14}"
   export SOCCER_MODEL_CROWD_OFFSET="${SOCCER_MODEL_CROWD_OFFSET:-0.75}"
