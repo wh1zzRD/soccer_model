@@ -1,109 +1,28 @@
-# AI-Generation of Soccer Highlights and Audio Commentaries
+# Soccer AI Commentator
 
-This project presents an end-to-end AI pipeline for automatically generating natural audio commentary from raw soccer match videos. Combining the latest advances in Computer Vision, Vision-Language Modeling (VLM), Large Language Models (LLM), and Text-to-Speech (TTS), the pipeline detects key actions, describes them chronologically, reformulates them into sports commentary, and synthesizes spoken audio. 
+An end-to-end AI pipeline that takes raw soccer match videos and automatically generates natural audio commentary. The pipeline detects key actions, describes them visually, reformulates them into sports-style narration, and synthesizes spoken audio.
 
-## Context
+Live demo: [goalmelody.lovable.app/pitch](https://goalmelody.lovable.app/pitch)
 
-Generating automated, high-quality soccer commentary from full-match videos is a highly relevant challenge with real-world applications, including YouTube highlights, automated post-match reporting, and textual recaps for sports media like L’Équipe. However, current multimodal AI models face limitations that prevent end-to-end solutions: video inputs must be drastically reduced due to token and memory constraints, and existing Vision-Language Models (VLMs) lack fine temporal understanding, narrative coherence, and emotional tone.
+## How it works
 
-To address this, we designed a modular and scalable pipeline combining vision, language, and audio generation — tailored to work under hardware constraints, yet easily upgradable as models evolve. Our approach breaks down the problem into specialized steps, allowing for flexible customization (e.g., prompts, FPS, resolution), rapid model replacement, and potential adaptation to other sports like basketball or e-sports. This project demonstrates the feasibility of such a system, offering a valuable foundation for future research and product development in sports analytics, media production, and AI-generated storytelling.
+The pipeline runs in 5 stages:
 
-<video src="https://github.com/user-attachments/assets/9ef1e9a8-7c0a-42a7-8ea9-f4ccabebc151" controls width="100%"></video> <video src="https://github.com/user-attachments/assets/5643d22c-89cb-4ca2-a31a-4694f95e1d92" controls width="100%"></video>
-You can watch the full demo of the solution by downloading Final_Demo.mp4
+1. **Action Spotting** — EfficientNetV2 CNN detects 17 action types (goals, fouls, corners, etc.) with timestamps
+2. **Player & Ball Tracking** — YOLOv8 + ByteTrack draws bounding boxes and persistent IDs on players and the ball
+3. **Visual Description** — Qwen2.5-VL-7B watches each clip and writes a timestamped description of what's happening
+4. **Commentary Generation** — Gemma 3-4B rewrites the description into broadcast-style sports commentary
+5. **Audio Synthesis** — Zonos TTS clones a commentator's voice and speaks the commentary with emotion control
 
-## Project Overview
-The pipeline consists of 5 main components, described below. \\
-![Project Pipeline](./img/pipeline.png)
+## Requirements
 
-### Soccer Data
-We used **SoccerNet v2**, a public benchmark dataset for soccer video understanding. This dataset served as the foundation for training and evaluating our models — particularly the Action Spotting and Tracking modules — while ensuring comparability with state-of-the-art approaches.
+- NVIDIA GPU with 24GB VRAM minimum
+- Python 3.10
+- Ubuntu (recommended for GPU server deployment)
 
-Key features:
-- 550+ full matches (~764 hours) from 6 major European leagues
-- Over 110,000 annotated events across 17 action classes (e.g., goal, foul, card, substitution, corner…)
-- Videos available in 720p and 224p, with frame-level annotations and timestamps
-- Fully accessible via the official Python API
+## Setup
 
-Why [SoccerNet](https://www.soccer-net.org)?
-- Recognized as the benchmark dataset in Computer Vision applied to Soccer
-- Hosts annual international challenges (CVPR, ECCV…) on tasks like Action Spotting, Replay Grounding, Multi-View Detection, etc.
-- Strong academic relevance: +5 Best Paper Awards (CVPR, ECCV), +60 published methods for Action Spotting
-- Practical applications: Performance analysis, TV broadcasting, scouting, VAR augmentation
-
-### 1. Action Spotting
-We selected an open-source model from the 2023 SoccerNet Action Spotting Challenge, originally developed by [Ruslan Baikulov (original github)](https://github.com/lRomul/ball-action-spotting). This model (that has become the standard baseline for SoccerNet 2024 Action Spotting challenge) belongs to a class of hybrid and lightweight Action Spotting architectures, offering a solid compromise between performance, robustness, and efficiency. Its design makes it particularly well-suited for deployment on modest GPUs, a crucial criterion for scalable and accessible solutions.
-
-The model works in three stages:
-- Visual Encoding: Consecutive grayscale frames are stacked and passed through a 2D CNN backbone (EfficientNetV2-B0) to extract spatial features.
-- Temporal Modeling: A lightweight 3D CNN merges motion cues across time to capture action dynamics.
-- Classification: A linear layer classifies each timestep into one of the SoccerNet action classes.
-
-We reused and refactored the original implementation to adapt it to our project structure:
-- Model architecture and training logic: available under `src/`.
-- Training and inference scripts: located in `scripts/`, with clear CLI options for configuration.
-- Model weights available in `data/action/`
-- The model is fully compatible with SoccerNet v2 and can be retrained or used for direct inference.
-
-### 2. Player & Ball Tracking
-To improve visual understanding and context for downstream models, we implemented a lightweight two-step tracking system, adapted from the [Roboflow Sports GitHub repository](https://github.com/roboflow/sports/tree/main).
-1. Detection: We use the YOLOv8 object detection model to detect players, referees, and the ball in each frame with high speed and precision.
-2. Tracking: Detections are linked across frames using ByteTrack, a high-performance multi-object tracking algorithm based on IoU matching and a two-stage association of low and high confidence detections.
-
-This combination allows us to:
-- Persistently track individual players and the ball across time,
-- Assign unique IDs and team colors,
-- Provide structured spatial and temporal context to the Vision-Language Model (VLM).
-Code for tracking can be found in `src/player_tracking/` (modular pipeline adapted from Roboflow)
-
-This approach enables the VLM to focus attention on relevant actors and motions, improving both action classification and description generation.
-
-<video src="https://github.com/user-attachments/assets/39a5404e-2ff0-400b-b9f7-7891efc3f97d" controls width="40%"></video>
-
-### 3. Action Description (VLM)
-To describe soccer actions from video clips, we tested and deployed several open-source Vision-Language Models (VLMs) locally — without relying on external APIs.
-Given the GPU memory constraints (max 24 GB VRAM), we designed a lightweight inference strategy:
-- Compact open-source models only
-- Use of FlashAttention and float16 inference to optimize memory and speed
-- Extensive benchmark of VLMs on football action clips (Phi-3.5 Vision, SmolVLM 2.2B, Apollo-7B, PaliGemma-3B, InternVL2.5, IBM Granite)
-	→ Winner: QWEN2.5-VL-7B for its overall performance and low hallucination rate
-
-Due to strict token and memory limits, we optimized video input as follows:
-- 10s clips, downsampled to 4 fps (preserves motion)
-- Resolution reduced to match GPU memory limits (c.220p with ours), while keeping player & ball tracking overlays for context
-- Best results came from clips with varied viewpoints and player close-ups
-
-Well-crafted prompts were critical to VLM performance. Ours included:
-- Action label (from Action Spotting)
-- Frame count and timestamps
-- Request to describe the clip by time chunks (e.g., 1s blocks)
-
-This led to temporally aligned outputs suitable for rephrasing and TTS. Complex instructions (e.g., asking for audio-ready commentary directly) reduced reliability.
-Code for VLM can be found in `src/vlm/vlm_utils.py`
-
-### 4. Textual Commentary (LLM)
-After generating raw descriptions with the VLM, we use a Large Language Model (LLM) to rephrase them into fluent, expressive sport commentaries. Since the LLM does not process videos directly, we can afford to use larger models optimized for text generation. Among various tested models (GPT-2, Mistral-7B, Qwen2.5-7B, Gemma 3-4B), we selected Gemma 3-4B Instruct for its strong balance between creativity and reliability (2% hallucination rate).
-The LLM receives a structured prompt that helps:
-- Add emotion and storytelling to the descriptions,
-- Reduce hallucinations from the VLM,
-- Maintain a short, coherent summary (~30 words).
-
-### 5. Audio Commentary (TTS)
-The final step of our pipeline transforms textual descriptions into natural, expressive audio commentary, simulating a real sports broadcast experience.
-We use Zonos, a Text-to-Speech model from the Coqui-TTS framework, selected for its open-source nature, fast inference, and advanced control over style and emotion. It allows us to specify voice tone parameters dynamically, making it especially suited for sports applications.
-Key features of our setup:
-- Voice cloning: We use real audio samples of Peter Drury, a renowned sports commentator, to synthesize voice with high fidelity and recognizable tone. The model only requires a 15s-30s long sample from the voice to synthetize, that you can add to the `data/MP3/input` folder.
-- Emotion embeddings: We encode emotions like happiness, excitement, or neutrality as a vector and pass it to the TTS model to modulate the speaking style.
-- Context-aware style: Two different voice inputs and sets of emotion parameters are used based on the action type: High-emotion voice for impactful actions (e.g. goals, penalties) vs. Neutral tone for routine actions (e.g. throw-ins, substitutions).
-- Low inference time: The full generation process is typically under 10 seconds per clip on a standard GPU.
-You can test Zonos and tune voice parameters on their playground: [Playground Zyphra Zonos](https://playground.zyphra.com/audio)
-
-## Quick Setup and Start
-### Requirements
-Install the requirements `pip install -r requirements.txt`.
-To run the pipeline with current parameters, you'll need a GPU with 24GB VRAM minimum. If you use a more powerful GPU, you can increase the VLM parameters (fps and max_resolution) within the `src/vlm/vlm_utils.py` file. 
-
-### Server start
-On an Ubuntu GPU server, use Python 3.10 and install the system dependencies first:
+Install system dependencies:
 
 ```bash
 sudo apt-get update
@@ -111,62 +30,46 @@ sudo apt-get install -y git-lfs ffmpeg espeak-ng
 git lfs install
 ```
 
-Then set up the Python environment from the project root:
+Set up the Python environment:
 
 ```bash
 python3.10 -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip setuptools wheel
+pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
+pip install fastapi uvicorn
 python download_vlm_weights.py
 ```
 
-The server must also have the local model/data assets that are not committed to git:
+## Adding a video
 
-- Action spotting weights: `data/action/experiments/action_sampling_weights_002/model-*.pth`
-- Qwen VLM weights: `Qwen2.5_7B_weights/`
-- Tracking weights: `src/player_tracking/data/*.pt`
-- Input videos: `data/soccernet/action-spotting-2023/{match_name}/1_720p.mkv` and optionally `2_720p.mkv`
-- Zonos TTS package/module for audio generation, or leave Audio Generation disabled in the UI
+Place your match video (720p, `.mkv`) in:
 
-Start the Gradio app:
-
-```bash
-GRADIO_SERVER_PORT=7860 ./start_server.sh
+```
+data/soccernet/action-spotting-2023/{match-name}/1_720p.mkv
 ```
 
-If your data lives outside the project folder, point the app to that root:
+For a full match with two halves, add both `1_720p.mkv` and `2_720p.mkv`.
+
+## Running
 
 ```bash
-SOCCER_MODEL_DATA_DIR=/path/to/data GRADIO_SERVER_PORT=7860 ./start_server.sh
+python server.py
 ```
 
-Open `http://<server-ip>:7860` in your browser. Make sure the firewall or reverse proxy allows port `7860`.
+Open `http://<server-ip>:7860` in your browser.
 
-### Download data and VLM model
-If you want to test the data on SoccerNet games, please see SoccerNet website (data protected by a NDA you'll need to sign at this [link](https://docs.google.com/forms/d/e/1FAIpQLSfYFqjZNm4IgwGnyJXDPk2Ko_lZcbVtYX73w5lf6din5nxfmA/viewform).
-You also need to execute `download_vlm_weights.py` to download Qwen2.5-VL weights.
+For a quick UI preview without ML dependencies:
 
-### Prepare the video and Run the pipeline
-To use the pipeline on your chosen video, you'll need to follow the following steps:
-1. Create a new folder in the `data/soccernet/action-spotting-2023` with the name of your match.
-2. 2. Add your video (720p is best) converted to .mkv format in this folder. If you want to analyze a full match (2 halves), you'll need to divide the match into two distinct videos with the name `{half}_720p.mkv`.
-3. Change the halves parameter at the bottom of the `src/constants.py` file to 1 or 2 depending on the number of extracts you would like to process.
-4. Execute the command `python3 app.py` that will launch the Gradio interface.
-5. Within the interface, you can select your target folder (and video). If it is the first time you process the video, select all pipeline steps. Once fully processed, you can unselect some/all of the steps to navigate within the commented clips.
+```bash
+python preview.py
+```
 
-### Closer look at the results
-The results of each step of the pipeline are saved throughout the process: 
-1. Action Spotting results: `data/app_test/action/{your_video}/results_spotting.json` Raw Clips (key actions): `data/app_test/action/{your_video}/clips`. All path/label associations are saved in `data/app_test/action/{your_video}/cache/original_clips.pkl`
-2. Tracking Clips: `data/app_test/action/{your_video}/clips_tracked`
-3. Action Descriptions: `data/app_test/action/{your_video}/cache/descriptions.pkl`
-4. Textual Commentary: `data/app_test/action/{your_video}/cache/commentary.pkl`
-5. Audio Commentary: `data/app_test/action/{your_video}/clips_tracked/commentary/`
-6. Final Commented Clips: `data/app_test/action/{your_video}/clips_commented/`
+## Output
 
-## Contributors
-- Antoine Bohin (CentraleSupélec / MVA) antoine.bohin@student-cs.fr
-- Ilyess Doragh (CentraleSupélec / MVA) ilyess.doragh@student-cs.fr
-- Mathieu Dujardin (CentraleSupélec) mathieu.dujardin@student-cs.fr
-- Logan Renaud (CentraleSupélec / MVA) logan.renaud@student-cs.fr
-- Project proposed by Sia Partners (Axel Darmouni and Guillaume Orset-Prelet)
+Results are saved at each stage under `data/app_test/action/{match-name}/`:
+
+- `clips/` — raw action clips
+- `clips_tracked/` — clips with player/ball overlays
+- `clips_commented/` — final clips with audio commentary merged in
+- `cache/` — intermediate outputs (descriptions, commentary text)
