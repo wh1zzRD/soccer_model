@@ -102,6 +102,47 @@ You can test Zonos and tune voice parameters on their playground: [Playground Zy
 Install the requirements `pip install -r requirements.txt`.
 To run the pipeline with current parameters, you'll need a GPU with 24GB VRAM minimum. If you use a more powerful GPU, you can increase the VLM parameters (fps and max_resolution) within the `src/vlm/vlm_utils.py` file. 
 
+### Server start
+On an Ubuntu GPU server, use Python 3.10 and install the system dependencies first:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git-lfs ffmpeg espeak-ng
+git lfs install
+```
+
+Then set up the Python environment from the project root:
+
+```bash
+python3.10 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+pip install -r requirements.txt
+python download_vlm_weights.py
+```
+
+The server must also have the local model/data assets that are not committed to git:
+
+- Action spotting weights: `data/action/experiments/action_sampling_weights_002/model-*.pth`
+- Qwen VLM weights: `Qwen2.5_7B_weights/`
+- Tracking weights: `src/player_tracking/data/*.pt`
+- Input videos: `data/soccernet/action-spotting-2023/{match_name}/1_720p.mkv` and optionally `2_720p.mkv`
+- Zonos TTS package/module for audio generation, or leave Audio Generation disabled in the UI
+
+Start the Gradio app:
+
+```bash
+GRADIO_SERVER_PORT=7860 ./start_server.sh
+```
+
+If your data lives outside the project folder, point the app to that root:
+
+```bash
+SOCCER_MODEL_DATA_DIR=/path/to/data GRADIO_SERVER_PORT=7860 ./start_server.sh
+```
+
+Open `http://<server-ip>:7860` in your browser. Make sure the firewall or reverse proxy allows port `7860`.
+
 ### Download data and VLM model
 If you want to test the data on SoccerNet games, please see SoccerNet website (data protected by a NDA you'll need to sign at this [link](https://docs.google.com/forms/d/e/1FAIpQLSfYFqjZNm4IgwGnyJXDPk2Ko_lZcbVtYX73w5lf6din5nxfmA/viewform).
 You also need to execute `download_vlm_weights.py` to download Qwen2.5-VL weights.

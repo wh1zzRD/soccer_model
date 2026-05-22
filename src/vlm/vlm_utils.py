@@ -124,101 +124,77 @@ def extract_video_clips(folder_path, actions, output_folder="data/clips/", clip_
 def describe_actions(clips, clip_length=10, use_tracking=True):
     descriptions = {}
 
-    for clip in clips:
-        with torch.no_grad():
-            model_id = "Qwen2.5_7B_weights"
-            processor = AutoProcessor.from_pretrained(model_id)
-            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                model_id, torch_dtype=torch.float16
-            ).to('cuda')
-            
-            if use_tracking:
-                action_context =f"""You are an expert video analyst for soccer matches.
-                                We have identified an important key action in the game, classified as: **{clip['label']}**. You will analyze a **{clip_length}-second video clip (25 FPS)** that captures this action.
-                                Your goal is to provide a **highly detailed, chronological, and timestamped description** of what happens during the clip so that a language model can later generate a rich and accurate spoken commentary.
+    model_id = "Qwen/Qwen2.5-VL-3B-Instruct"
+    processor = AutoProcessor.from_pretrained(model_id)
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        model_id, torch_dtype=torch.float16
+    ).to('cuda')
 
-                                ---
+    try:
+        for clip in clips:
+            with torch.no_grad():
+                action_context = f"""You are an expert soccer video analyst.
+Analyze this {clip_length}-second clip. The detected action label is: {clip['label']}.
 
-                                **Important Instructions:**
-                                - **Use the full set of frames provided** (≈40 frames sampled at 4 FPS).
-                                Group your analysis into 1-second chunks (4 frames = 1 second). Use headings like: **Time: 0s–1s**, **1s–2s**, etc.
-                                Within each section, summarize what happens in those frames — DO NOT repeat the same description.
+Describe only what is visible, in chronological order. Use short timestamped sections:
+0s-2s, 2s-4s, 4s-6s, 6s-8s, 8s-10s.
 
-                                - Within each time block, describe the **main movements and interactions** during that segment.
-                                - Focus on **player actions**, **ball trajectory**, **interactions**, **team roles** (based on jersey color), and **goal attempts**.
-                                - Use information from visual cues:
-                                    - Players = **orange**, Referees = **yellow**, Goalkeepers = **blue**, Ball = **purple** (⚠️ not always accurate).
-                                - ⚠️ **Avoid repeating the same shot/save multiple times.** If an action spans 2–3 frames, **describe it only once**.
-                                - Be vivid but do **not hallucinate** — describe what is visible, frame-by-frame.
-                                """
-                # action_context =f"""You are an expert video analyst for soccer matches.
-                #                 We have identified an important key action in the game, classified as: **{clip['label']}**. You will analyze a **{clip_length}-second video clip (25 FPS)** that captures this action.
-                #                 Your goal is to provide a **highly detailed, chronological, and timestamped description** of what happens during the clip so that a language model can later generate a rich and accurate spoken commentary.
+Focus on:
+- which jersey color has the ball
+- passes, shots, saves, fouls, ball out of play, or the exact goal moment
+- ball movement and goalkeeper/player reactions
+- do not invent team names or repeat the same event
+- if this is a Goal, say when the ball actually crosses the line
+"""
 
-                #                 **Important Instructions:**
-                #                 - **Use the full set of frames provided** (≈40 frames sampled at 4 FPS).
-                #                 Group your analysis into 5-seconds chunks (20 frames = 5 seconds). Use these 2 headings only since you have a 10 seconds video : **Time: 0s–5s**, **5s–10s**
-                #                 Within each section, summarize what happens in those frames.
-                #                 - Within each time block, describe the **main movements and interactions** during that segment.
-                #                 """
+                messages = [{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "video",
+                            "video": clip["path"],
+                            "max_pixels": 60000,
+                            "fps": 4.0
+                        },
+                        {
+                            "type": "text",
+                            "text": action_context
+                        }
+                    ]
+                }]
 
-            else:
-                action_context =f"""You are an expert video analyst for soccer matches. 
-                            We have identified an important action classified as: **{clip['label']}**. Use it to understand the action.
-                            You will analyze a **{clip_length}-SECOND** video clip capturing this action.
+                text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                image_inputs, video_inputs = process_vision_info(messages)
+                print("🎞️ Number of frames processed:", video_inputs[0].shape[0], f"label = {clip['label']}", flush=True)
+                inputs = processor(
+                    text=[text],
+                    images=image_inputs,
+                    videos=video_inputs,
+                    padding=True,
+                    return_tensors="pt"
+                ).to("cuda")
 
-                            Be careful: Your analysis must be **CHRONOLOGICAL - DESCRIBE THE ACTION STEP-BY-STEP WITH TIMESTAMPS (betwen 0 and {clip_length} sec)**, from the beginning of the clip to the end. 
-                            
-                            Your role is to describe the action STEP BY STEP EXHAUSTIVELY:
-                            - Identify each player's **MOVEMENTS** and **POSITIONING**.
-                            - Track the **BALL'S TRAJECTORY** and **HOW IT IS PASSED, INTERCEPTED or SHOT**.
-                            - You can describe **WHICH TEAM** has the ball or defends using the **JERSEY COLORS**.
-                            - Detail **INTERACTIONS BETWEEN PLAYERS** (e.g., duels, passes, pressing).
-                            - Include relevant **CONTEXTUAL ELEMENTS** (e.g., referee’s decisions, reactions from teammates or opponents).
-                            
-                            ENSURE THAT YOUR DESCRIPTION IS HIGHLY DETAILED AND STRUCTURED,** so it provides enough information for an **LLM TO LATER GENERATE A FULL AND NATURAL SPORTS COMMENTARY** of this action.
-                            **AVOID SUMMARIZATION**—focus on **PRECISE DETAILS** to ensure a **VIVID AND ACCURATE** account of the scene.
-                            """
+                generated_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=int(os.environ.get("SOCCER_MODEL_VLM_MAX_NEW_TOKENS", "512")),
+                )
+                generated_ids_trimmed = generated_ids[:, inputs.input_ids.shape[1]:]
+                description = processor.batch_decode(
+                    generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                )[0]
 
-            messages = [{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "video",
-                        "video": clip["path"],
-                        #"max_pixels": 270 * 315,
-                        "max_pixels": 60000,
-                        "fps": 4.0  
-                    },
-                    {
-                        "type": "text",
-                        "text": action_context
-                    }
-                ]
-            }]
+                print(description, flush=True)
 
-            text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            image_inputs, video_inputs = process_vision_info(messages)
-            print("🎞️ Number of frames processed:", video_inputs[0].shape[0], f"label = {clip['label']}")
-            inputs = processor(
-                text=[text],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt"
-            ).to("cuda")
-            
-            generated_ids = model.generate(**inputs, max_new_tokens=1028) #do_sample=True, top_p=0.9)
-            generated_ids_trimmed = generated_ids[:, inputs.input_ids.shape[1]:] 
-            description = processor.batch_decode(
-                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-            )[0]
-
-
-            print(description)
-
-            descriptions[clip["path"]] = {"timestamp": clip["gameTime"], "label": clip["label"], "description": description}
-        del processor, model, messages, text, inputs, image_inputs, video_inputs, generated_ids, generated_ids_trimmed, description
+                descriptions[clip["path"]] = {
+                    "timestamp": clip["gameTime"],
+                    "label": clip["label"],
+                    "description": description,
+                }
+                del messages, text, inputs, image_inputs, video_inputs, generated_ids, generated_ids_trimmed
+                torch.cuda.empty_cache()
+                gc.collect()
+    finally:
+        del processor, model
         torch.cuda.empty_cache()
         gc.collect()
 

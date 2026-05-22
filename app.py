@@ -24,20 +24,69 @@ from src import constants
 from scripts.action.predict import predict_single_video
 from src.vlm.vlm_utils import get_key_actions, extract_video_clips, describe_actions
 from src.vlm.llm_utils import generate_commentary
-from src.player_tracking.main import create_tracked_video
-
 sys.path.append(os.path.abspath("src"))
-sys.path.append(os.path.abspath("src/zonos"))
-from zonos.sample import generate_audio_commentary
+sys.path.insert(0, os.path.abspath("src/zonos"))
+
+try:
+    from zonos.sample import generate_audio_commentary
+    ZONOS_IMPORT_ERROR = None
+except ImportError as exc:
+    generate_audio_commentary = None
+    ZONOS_IMPORT_ERROR = exc
 
 
-VIDEO_DIRECTORY = "./data/soccernet/action-spotting-2023"
+VIDEO_DIRECTORY = str(constants.soccernet_dir)
+VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv")
+
+
+def _video_choices(folder_path):
+    videos = [
+        f for f in os.listdir(folder_path)
+        if f.endswith(VIDEO_EXTENSIONS) and not f.startswith("original_")
+    ]
+    return sorted(videos, key=lambda name: (name != "1_720p.mkv", name))
+
+
+def _all_video_choices():
+    choices = []
+    for folder in list_folders():
+        folder_path = os.path.join(VIDEO_DIRECTORY, folder)
+        for video in _video_choices(folder_path):
+            choices.append(f"{folder}/{video}")
+    return choices
+
+
+def _split_video_choice(folder_name, video_name):
+    if isinstance(video_name, str) and "/" in video_name:
+        folder, video = video_name.split("/", 1)
+        return folder, video
+    return folder_name, video_name
+
+
+def _source_video_path(folder_name, video_name, single_match):
+    if single_match:
+        return os.path.join(VIDEO_DIRECTORY, folder_name, video_name)
+
+    canonical_path = os.path.join(VIDEO_DIRECTORY, folder_name, "1_720p.mkv")
+    if os.path.exists(canonical_path):
+        return canonical_path
+
+    fallback_path = os.path.join(VIDEO_DIRECTORY, folder_name, video_name)
+    if os.path.exists(fallback_path):
+        return fallback_path
+
+    folder_path = os.path.join(VIDEO_DIRECTORY, folder_name)
+    videos = _video_choices(folder_path) if os.path.exists(folder_path) else []
+    if videos:
+        return os.path.join(folder_path, videos[0])
+
+    return fallback_path
 
 
 def list_folders():
     """Liste les dossiers disponibles contenant des vidéos"""
     folders = [f for f in os.listdir(VIDEO_DIRECTORY) if os.path.isdir(os.path.join(VIDEO_DIRECTORY, f))]
-    return folders
+    return sorted(folders)
 
 def list_videos_in_folder(folder_name):
     """Liste les vidéos dans le dossier sélectionné"""
@@ -49,7 +98,7 @@ def list_videos_in_folder(folder_name):
     if not os.path.exists(folder_path):  # Vérifie que le dossier existe
         return gr.update(choices=[], value=None)
 
-    videos = [f for f in os.listdir(folder_path) if f.endswith(('.mp4', '.avi', '.mov', '.mkv'))]
+    videos = _video_choices(folder_path)
 
     if videos:
         return gr.update(choices=videos, value=videos[0])  # Met la première vidéo par défaut
@@ -57,10 +106,7 @@ def list_videos_in_folder(folder_name):
         return gr.update(choices=[], value=None)  # Aucune vidéo trouvée
 
 def toggle_video_dropdown(mode_choice):
-    if mode_choice == "Analyze specific extract":
-        return gr.update(visible=True)
-    else:
-        return gr.update(visible=False)
+    return gr.update(visible=True)
 
 def merge_video_with_audio(video_path: str, audio_path: str, output_path: str):
     """
@@ -77,20 +123,86 @@ def merge_video_with_audio(video_path: str, audio_path: str, output_path: str):
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)  # Ensure output folder exists
 
-    # If the video has no audio, add a silent track
-    merge_cmd = [
-        "ffmpeg",
-        "-y",  # Overwrite if exists
-        "-i", video_path,  # Input video
-        "-i", audio_path,  # Input audio
-        #"-c:a", "aac",
-        "-acodec", "copy",
-        "-vcodec", "copy",
-        "-c:v", "libx264",        # Re-encode video to H.264
-        "-c:a", "aac",             # Re-encode audio to AAC
-        "-shortest",
-        output_path
-    ]
+    with VideoFileClip(video_path) as video_clip:
+        video_duration_seconds = float(video_clip.duration)
+    with AudioFileClip(audio_path) as audio_clip:
+        audio_duration_seconds = float(audio_clip.duration)
+
+    output_duration_seconds = max(video_duration_seconds, audio_duration_seconds)
+    video_extension_seconds = max(0.0, output_duration_seconds - video_duration_seconds)
+    video_duration = f"{output_duration_seconds:.3f}"
+    video_filter = (
+        f"[0:v]tpad=stop_mode=clone:stop_duration={video_extension_seconds:.3f},"
+        "format=yuv420p[vout];"
+    )
+
+    crowd_path = os.environ.get("SOCCER_MODEL_CROWD_AUDIO")
+    crowd_volume = os.environ.get("SOCCER_MODEL_CROWD_VOLUME", "0.14")
+    crowd_offset = os.environ.get("SOCCER_MODEL_CROWD_OFFSET", "0.75")
+    commentary_volume = os.environ.get("SOCCER_MODEL_COMMENTARY_VOLUME", "1.35")
+
+    # Keep the full video duration. If commentary is shorter than the clip,
+    # pad it with silence and optionally keep a crowd bed under the whole clip.
+    if crowd_path and os.path.exists(crowd_path):
+        merge_cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            video_path,
+            "-i",
+            audio_path,
+            "-stream_loop",
+            "-1",
+            "-i",
+            crowd_path,
+            "-filter_complex",
+            (
+                video_filter +
+                f"[1:a]aresample=44100,loudnorm=I=-16:LRA=8:TP=-1.5,"
+                f"volume={commentary_volume},apad[a1];"
+                f"[2:a]atrim=start={crowd_offset},asetpts=PTS-STARTPTS,aresample=44100,"
+                f"volume={crowd_volume},highpass=f=120,lowpass=f=6500[a2];"
+                "[a1][a2]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
+                "alimiter=limit=0.95[aout]"
+            ),
+            "-map",
+            "[vout]",
+            "-map",
+            "[aout]",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            "-t",
+            video_duration,
+            output_path,
+        ]
+    else:
+        merge_cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            video_path,
+            "-i",
+            audio_path,
+            "-filter_complex",
+            (
+                video_filter +
+                f"[1:a]aresample=44100,loudnorm=I=-16:LRA=8:TP=-1.5,"
+                f"volume={commentary_volume},apad,alimiter=limit=0.95[aout]"
+            ),
+            "-map",
+            "[vout]",
+            "-map",
+            "[aout]",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            "-t",
+            video_duration,
+            output_path,
+        ]
 
     try:
         subprocess.run(merge_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -113,6 +225,7 @@ def convert_wav_to_mp3(input_wav: str, output_mp3: str, bitrate="192k"):
     """
     command = [
         "ffmpeg",
+        "-y",
         "-i", input_wav,  # Input WAV file
         "-c:a", "libmp3lame",  # Use LAME MP3 encoder
         "-b:a", bitrate,  # Set audio bitrate
@@ -139,6 +252,7 @@ def merge_all_videos_with_audio(CLIPS_DIR, COMMENTARY_DIR, OUTPUT_DIR):
     #COMMENTARY_DIR = os.path.join(CLIPS_DIR, "commentary")
     #OUTPUT_DIR = os.path.join(BASE_DIR, "data/commented_clips")
     
+    os.makedirs(COMMENTARY_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)  # Ensure output folder exists
 
     # Convert all WAV files to MP3
@@ -146,8 +260,7 @@ def merge_all_videos_with_audio(CLIPS_DIR, COMMENTARY_DIR, OUTPUT_DIR):
         if audio_file.endswith(".wav"):
             wav_path = os.path.join(COMMENTARY_DIR, audio_file)
             mp3_path = os.path.join(COMMENTARY_DIR, os.path.splitext(audio_file)[0] + ".mp3")
-            if not os.path.exists(mp3_path):  # Convert only if MP3 doesn't exist
-                convert_wav_to_mp3(wav_path, mp3_path)
+            convert_wav_to_mp3(wav_path, mp3_path)
 
     # Process each video in `data/clips/`
     for video_file in os.listdir(CLIPS_DIR):
@@ -161,140 +274,341 @@ def merge_all_videos_with_audio(CLIPS_DIR, COMMENTARY_DIR, OUTPUT_DIR):
                 merge_video_with_audio(video_path, audio_path, output_path)
             else:
                 print(f"⚠ No matching audio found for {video_file}. Skipping.")
-    
 
-def full_pipeline(folder_name, video_name, video_prediction=True, clip_extraction=True, use_tracking=True, generate_description=True, gen_commentary=True, generate_audio=True, single_match=False):
-    
-    experiment, split = "action_sampling_weights_002", "test"
-    ############## INFO ABOUT THE VIDEO ##############
-    if single_match:
-        game = folder_name + "/" + video_name
-    else:
-        game = folder_name
-    video = cv2.VideoCapture(VIDEO_DIRECTORY + "/" + folder_name + "/" + video_name)
-    constants.video_fps = float(video.get(cv2.CAP_PROP_FPS))
 
-    constants.test_games = [game]
-    prediction_dir = os.path.join("data", "app_test", "action/")
-
-    clips_dir=os.path.join(prediction_dir, game, "clips")
-    output_dir=os.path.join(prediction_dir, game, "clips_commented")
-
-    clip_cache_path = os.path.join(prediction_dir, game, "cache", "original_clips.pkl")
-    os.makedirs(os.path.dirname(clip_cache_path), exist_ok=True)
-
-    desc_cache_path = os.path.join(prediction_dir, game, "cache", "descriptions.pkl")
-    os.makedirs(os.path.dirname(desc_cache_path), exist_ok=True)
-
-    commentary_cache_path = os.path.join(prediction_dir, game, "cache", "commentary.pkl")
-    os.makedirs(os.path.dirname(commentary_cache_path), exist_ok=True)
-
-    ######################### ACTION SPOTTING #############################
-    yield "Running Action Spotting model on video...", [], {}, {}, {}
-    if video_prediction:
-        predict_single_video(experiment, split, 0, False, Path(prediction_dir), constants, single_match=False)
-    else:
-        time.sleep(2)
-
-    ########################## CLIP EXTRACTION ############################
-    actions = get_key_actions(game, confidence_threshold=0.8)
-
-    yield f"Action Spotting completed, {len(actions)} key actions were identified! Extraction of the highlight clips...", [], {}, {}, {}
-    if clip_extraction:
-        original_clips = extract_video_clips(os.path.join(VIDEO_DIRECTORY, game), actions, clips_dir, clip_length=10)
-        with open(clip_cache_path, "wb") as f:
-            pickle.dump(original_clips, f)
-    else:
-        if os.path.exists(clip_cache_path):
-            with open(clip_cache_path, "rb") as f:
-                original_clips = pickle.load(f)
-        else:
-            raise FileNotFoundError(f"Commentary cache not found at {commentary_cache_path}. Run with gen_commentary=True first.")
-        time.sleep(2)
-    original_clips = []
-    for i, action in enumerate(actions):
-        label = action["label"].replace(" ", "_")
-        output_clip_path = os.path.join(clips_dir, f"clip_{i}_{label}.mp4")
-        original_clips.append({"path": output_clip_path, "label": action["label"], "gameTime": action["gameTime"]})
-
-    ######################## CLIP MAPPING ################################
-    if use_tracking:
-        os.makedirs(os.path.join(prediction_dir, game,"clips_tracked"), exist_ok=True)
-        # Create a tracked video for each clip
-        for clip in original_clips:
-            clip_path = clip["path"]
-            clip_path = clip_path.replace(" ", "_")
-            video_path = clip['path'].replace("clips", "clips_tracked")
-            video_path = video_path.replace(" ", "_")
-            create_tracked_video(
-                source_video_path=clip_path,
-                target_video_path=video_path,
-                device="cuda"
-            )
-        clips = [{"path": clip["path"].replace("clips", "clips_tracked"), "label": clip["label"], "gameTime": clip["gameTime"]} for clip in original_clips]
-        commentary_dir=os.path.join(prediction_dir, game, "clips_tracked", "commentary")
-    else:
-        clips = original_clips
-        commentary_dir=os.path.join(prediction_dir, game, "clips", "commentary")
-    clips = [{"path": clip["path"].replace("clips", "clips_tracked"), "label": clip["label"], "gameTime": clip["gameTime"]} for clip in original_clips]
-    commentary_dir=os.path.join(prediction_dir, game, "clips_tracked", "commentary")
-
-    clip_choices = [f"{clip['gameTime']} {clip['label']}" for clip in original_clips]
-    clip_mapping = {f"{clip['gameTime']} {clip['label']}": clip["path"].replace("clips", "clips_commented") for clip in original_clips}
-    yield f"Highlight clips extracted! Generating AI descriptions...", gr.update(choices=clip_choices, value=clip_choices[0] if clip_choices else None, visible=True), {}, {}, {}
-    
-    ###################### DESCRIPTION GENERATION #######################
-    # match_context = "It's a Premier League match between Tottenham and Chelsea. Tottenham plays with white jerseys, and Chelsea plays with dark blue jerseys."
-    # match_context = "It's a futsal game between two teams, blue jersey vs green jersey. The game is played in a small indoor court with a goal at each end."
-    match_context = "It's a football game between two teams wearing differents jerseys where we have to comment the actions of the game. PSG is playing in white jerseys, Barcelona in blue with red stripes jersey."
-    if generate_description:
-        descriptions = describe_actions(clips, clip_length=10, use_tracking=True)
-        with open(desc_cache_path, "wb") as f:
-            pickle.dump(descriptions, f)
-    else:
-        if os.path.exists(desc_cache_path):
-            with open(desc_cache_path, "rb") as f:
-                descriptions = pickle.load(f)
-        else:
-            raise FileNotFoundError(f"Description cache not found at {desc_cache_path}. Run with generate_description=True first.")
-        time.sleep(2)
-    
-    # descriptions dictionary has the format: descriptions[clip["path"]] = {"timestamp": clip["gameTime"], "label": clip["label"], "description": description}
-    yield f"AI Descriptions generated! Now we reformulate them into natural sport commentaries...", gr.update(choices=clip_choices, value=clip_choices[0] if clip_choices else None, visible=True), {}, {}, {}
-    ################### TEXTUAL COMMENTARY ###########################
-    if gen_commentary:
-        results = generate_commentary(descriptions, match_context)
-        with open(commentary_cache_path, "wb") as f:
-            pickle.dump(results, f)
-    else:
-        if os.path.exists(commentary_cache_path):
-            with open(commentary_cache_path, "rb") as f:
-                results = pickle.load(f)
-        time.sleep(2)
-
-    yield f"Textual commentaries generated! Now generating audio commentaries and merging with the video clips...", gr.update(choices=clip_choices, value=clip_choices[0] if clip_choices else None, visible=True), {}, {}, {}
-    if generate_audio:
-        for clip in clips:
-            clip_path= clip["path"]
-            generate_audio_commentary(clip_path, results[clip_path]["Generated Commentary"], clip['label'])
-        merge_all_videos_with_audio(CLIPS_DIR=clips_dir, COMMENTARY_DIR=commentary_dir, OUTPUT_DIR=output_dir)
-    else:   
-        time.sleep(2)
-
-    ############ Extract list of unique labels for filtering the highlights ###########
+def build_highlight_filters(original_clips):
     unique_labels = sorted(set([clip["label"] for clip in original_clips]))
     label_to_highlights = {}
     for label in unique_labels:
         label_to_highlights[label] = [
-            f"{clip['gameTime']} {clip['label']}"
+            _clip_display_name(clip)
             for clip in original_clips if clip["label"] == label
         ]
-        
-    yield "✅ Generation complete! Select a highlight to view.", gr.update(choices=['Choose a highlight'] + clip_choices, value='Choose a highlight', visible=True), clip_mapping, results, descriptions, unique_labels, label_to_highlights, gr.update(choices=unique_labels, value=unique_labels[0] if unique_labels else None)
+    return unique_labels, label_to_highlights
+
+
+def _clip_display_name(clip: dict) -> str:
+    return f"{clip['gameTime']} {clip['label']}"
+
+
+def _normalise_highlight_name(value: str) -> str:
+    return " ".join(value.split()).strip().lower()
+
+
+def _resolve_highlight_name(clip_name: str, clip_mapping: dict) -> str | None:
+    if clip_name in clip_mapping:
+        return clip_name
+
+    wanted = _normalise_highlight_name(clip_name)
+    for mapped_name in clip_mapping:
+        if _normalise_highlight_name(mapped_name) == wanted:
+            return mapped_name
+
+    return None
+
+
+def _cache_missing(path: str, step: str) -> FileNotFoundError:
+    return FileNotFoundError(
+        f"{step} cache not found at {path}. Enable the required previous step once, then rerun."
+    )
+
+
+def _find_clip_key(data: dict, clip_path: str) -> str | None:
+    candidates = [
+        clip_path,
+        clip_path.replace("clips", "clips_tracked"),
+        clip_path.replace("clips_tracked", "clips"),
+    ]
+    for candidate in candidates:
+        if candidate in data:
+            return candidate
+    return None
+
+
+def _is_video_readable(path: str) -> bool:
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return False
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "csv=p=0",
+            path,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return result.returncode == 0 and "video" in result.stdout
+
+
+def _remove_unreadable_video(path: str):
+    if os.path.exists(path) and not _is_video_readable(path):
+        print(f"Removing unreadable cached video: {path}")
+        os.remove(path)
+
+
+def _has_entries_for_clips(data: dict, clips: list[dict], field: str | None = None) -> bool:
+    if not isinstance(data, dict):
+        return False
+    for clip in clips:
+        key = _find_clip_key(data, clip["path"])
+        if key is None:
+            return False
+        if field and field not in data.get(key, {}):
+            return False
+    return True
+
+
+def _clips_are_readable(clips: list[dict]) -> bool:
+    return bool(clips) and all(_is_video_readable(clip["path"]) for clip in clips)
+
+
+def _run_action_spotting_subprocess(
+    experiment: str,
+    split: str,
+    game: str,
+    prediction_dir: str,
+    video_fps: float,
+    single_match: bool,
+):
+    """Run action spotting in a separate process so CUDA library fixes stay isolated."""
+    env = os.environ.copy()
+    venv = env.get("VIRTUAL_ENV")
+    if venv and env.get("SOCCER_MODEL_ACTION_USE_LD_FIX", "1").lower() not in {"0", "false", "no"}:
+        nvidia_libs = [
+            f"{venv}/lib/python3.10/site-packages/nvidia/cublas/lib",
+            f"{venv}/lib/python3.10/site-packages/nvidia/cuda_runtime/lib",
+            f"{venv}/lib/python3.10/site-packages/nvidia/cudnn/lib",
+            f"{venv}/lib/python3.10/site-packages/nvidia/cufft/lib",
+            f"{venv}/lib/python3.10/site-packages/nvidia/curand/lib",
+            f"{venv}/lib/python3.10/site-packages/nvidia/cusolver/lib",
+            f"{venv}/lib/python3.10/site-packages/nvidia/cusparse/lib",
+            f"{venv}/lib/python3.10/site-packages/nvidia/nccl/lib",
+        ]
+        env["LD_LIBRARY_PATH"] = ":".join(nvidia_libs + [env.get("LD_LIBRARY_PATH", "")])
+        env["LD_PRELOAD"] = (
+            f"{nvidia_libs[0]}/libcublasLt.so.12:"
+            f"{nvidia_libs[0]}/libcublas.so.12"
+        )
+
+    code = f"""
+from pathlib import Path
+from src import constants
+from scripts.action.predict import predict_single_video
+constants.video_fps = {video_fps!r}
+constants.test_games = [{game!r}]
+constants.halves = list(range(1, int(__import__('os').environ.get('SOCCER_MODEL_NUM_HALVES', '1')) + 1))
+predict_single_video({experiment!r}, {split!r}, 0, False, Path({prediction_dir!r}), constants, single_match={single_match!r})
+"""
+    subprocess.run([sys.executable, "-c", code], check=True, env=env)
+
+
+def _create_tracked_video_subprocess(source_path: str, target_path: str, device: str) -> bool:
+    """Create tracked video outside the Gradio process so crashes do not kill the app."""
+    env = os.environ.copy()
+    env.pop("LD_PRELOAD", None)
+    env.pop("LD_LIBRARY_PATH", None)
+    timeout = int(env.get("SOCCER_MODEL_TRACKING_TIMEOUT", "900"))
+    code = f"""
+from src.player_tracking.main import create_tracked_video
+create_tracked_video({source_path!r}, {target_path!r}, device={device!r})
+"""
+    try:
+        subprocess.run([sys.executable, "-c", code], check=True, env=env, timeout=timeout)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        print(f"Tracking failed for {source_path}: {exc}")
+        _remove_unreadable_video(target_path)
+        return False
+    if not _is_video_readable(target_path):
+        _remove_unreadable_video(target_path)
+        return False
+    return True
+    
+
+def full_pipeline(folder_name, video_name, video_prediction=True, clip_extraction=True, use_tracking=True, generate_description=True, gen_commentary=True, generate_audio=True, single_match=False):
+    experiment, split = "action_sampling_weights_002", "test"
+    game = f"{folder_name}/{video_name}" if single_match else folder_name
+    source_video_path = _source_video_path(folder_name, video_name, single_match)
+    video = cv2.VideoCapture(source_video_path)
+    constants.video_fps = float(video.get(cv2.CAP_PROP_FPS))
+    video.release()
+    if not constants.video_fps:
+        raise ValueError(f"Could not read FPS from video: {source_video_path}")
+
+    constants.test_games = [game]
+    prediction_dir = os.path.join("data", "app_test", "action")
+    game_prediction_dir = os.path.join(prediction_dir, game)
+    clips_dir = os.path.join(game_prediction_dir, "clips")
+    tracked_clips_dir = os.path.join(game_prediction_dir, "clips_tracked")
+    output_dir = os.path.join(game_prediction_dir, "clips_commented")
+    cache_dir = os.path.join(game_prediction_dir, "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    clip_cache_path = os.path.join(cache_dir, "original_clips.pkl")
+    desc_cache_path = os.path.join(cache_dir, "descriptions.pkl")
+    commentary_cache_path = os.path.join(cache_dir, "commentary.pkl")
+    spotting_path = os.path.join(game_prediction_dir, "results_spotting.json")
+
+    empty_update = ([], {}, {}, {}, [], {}, gr.update())
+    if video_prediction or not os.path.exists(spotting_path):
+        status = "Running Action Spotting model on video..."
+        if not video_prediction:
+            status = "Action Spotting cache missing, running it now..."
+        yield status, *empty_update
+        _run_action_spotting_subprocess(
+            experiment=experiment,
+            split=split,
+            game=game,
+            prediction_dir=prediction_dir,
+            video_fps=constants.video_fps,
+            single_match=single_match,
+        )
+
+    actions = get_key_actions(game, confidence_threshold=0.8)
+    yield f"Action Spotting ready, {len(actions)} key actions identified.", *empty_update
+
+    original_clips = []
+    if not clip_extraction and os.path.exists(clip_cache_path):
+        with open(clip_cache_path, "rb") as f:
+            original_clips = pickle.load(f)
+        if not _clips_are_readable(original_clips):
+            print("Clip cache exists, but one or more clip files are missing or unreadable. Regenerating clips.")
+            original_clips = []
+
+    if clip_extraction or not original_clips:
+        status = "Extracting highlight clips..."
+        if not clip_extraction:
+            status = "Clip cache missing or invalid, extracting highlight clips now..."
+        yield status, *empty_update
+        original_clips = extract_video_clips(
+            os.path.join(VIDEO_DIRECTORY, game),
+            actions,
+            clips_dir,
+            clip_length=10,
+            single_match=single_match,
+        )
+        with open(clip_cache_path, "wb") as f:
+            pickle.dump(original_clips, f)
+
+    if not _clips_are_readable(original_clips):
+        raise RuntimeError("Clip extraction did not produce readable video clips.")
+
+    active_tracking = False
+    if use_tracking:
+        os.makedirs(tracked_clips_dir, exist_ok=True)
+        tracked_clips = []
+        tracking_device = os.environ.get("SOCCER_MODEL_TRACKING_DEVICE", "cuda")
+        yield "Preparing tracked clips...", *empty_update
+        for clip in original_clips:
+            source_path = clip["path"].replace(" ", "_")
+            tracked_path = clip["path"].replace("clips", "clips_tracked").replace(" ", "_")
+            _remove_unreadable_video(tracked_path)
+            if _is_video_readable(tracked_path):
+                print(f"Using cached tracked video: {tracked_path}")
+                tracking_ok = True
+            else:
+                tracking_ok = _create_tracked_video_subprocess(source_path, tracked_path, tracking_device)
+            if not tracking_ok:
+                print("Player tracking failed. Continuing with the original clips.")
+                tracked_clips = []
+                break
+            tracked_clips.append({"path": tracked_path, "label": clip["label"], "gameTime": clip["gameTime"]})
+
+        active_tracking = _clips_are_readable(tracked_clips)
+        if not active_tracking:
+            yield "⚠️ Player tracking failed or timed out. Continuing with normal clips.", *empty_update
+
+    if active_tracking:
+        clips = tracked_clips
+        commentary_dir = os.path.join(tracked_clips_dir, "commentary")
+        display_clip_dir = tracked_clips_dir
+    else:
+        clips = original_clips
+        commentary_dir = os.path.join(clips_dir, "commentary")
+        display_clip_dir = clips_dir
+
+    clip_choices = [_clip_display_name(clip) for clip in original_clips]
+    clip_mapping = {
+        _clip_display_name(clip): os.path.join(output_dir, os.path.basename(clip["path"]))
+        for clip in original_clips
+    }
+    unique_labels, label_to_highlights = build_highlight_filters(original_clips)
+
+    descriptions = {}
+    if os.path.exists(desc_cache_path):
+        with open(desc_cache_path, "rb") as f:
+            descriptions = pickle.load(f)
+
+    needs_descriptions = generate_description or gen_commentary or generate_audio
+    if needs_descriptions and (generate_description or not _has_entries_for_clips(descriptions, clips, "description")):
+        status = "Generating visual descriptions..."
+        if not generate_description:
+            status = "Description cache missing or outdated, generating descriptions now..."
+        yield status, gr.update(choices=clip_choices, value=clip_choices[0] if clip_choices else None, visible=True), clip_mapping, {}, {}, unique_labels, label_to_highlights, gr.update(choices=unique_labels, value=unique_labels[0] if unique_labels else None)
+        descriptions = describe_actions(clips, clip_length=10, use_tracking=active_tracking)
+        with open(desc_cache_path, "wb") as f:
+            pickle.dump(descriptions, f)
+
+    results = {}
+    if os.path.exists(commentary_cache_path):
+        with open(commentary_cache_path, "rb") as f:
+            results = pickle.load(f)
+
+    needs_commentary = gen_commentary or generate_audio
+    match_context = "It's a football game between two teams wearing different jerseys. Avoid naming teams unless the team identity is certain."
+    timed_commentary_enabled = os.environ.get("SOCCER_MODEL_TIMED_COMMENTARY", "1").lower() not in {"0", "false", "no"}
+    required_commentary_field = "Timed Commentary" if timed_commentary_enabled and generate_audio else "Generated Commentary"
+    if needs_commentary and (gen_commentary or not _has_entries_for_clips(results, clips, required_commentary_field)):
+        if not _has_entries_for_clips(descriptions, clips, "description"):
+            yield "Description cache missing or outdated, generating descriptions now...", gr.update(choices=clip_choices, value=clip_choices[0] if clip_choices else None, visible=True), clip_mapping, {}, {}, unique_labels, label_to_highlights, gr.update(choices=unique_labels, value=unique_labels[0] if unique_labels else None)
+            descriptions = describe_actions(clips, clip_length=10, use_tracking=active_tracking)
+            with open(desc_cache_path, "wb") as f:
+                pickle.dump(descriptions, f)
+        status = "Generating commentary text..."
+        if not gen_commentary:
+            status = "Commentary cache missing or outdated, generating commentary text now..."
+        yield status, gr.update(choices=clip_choices, value=clip_choices[0] if clip_choices else None, visible=True), clip_mapping, {}, descriptions, unique_labels, label_to_highlights, gr.update(choices=unique_labels, value=unique_labels[0] if unique_labels else None)
+        results = generate_commentary(descriptions, match_context)
+        with open(commentary_cache_path, "wb") as f:
+            pickle.dump(results, f)
+
+    if generate_audio:
+        yield "Generating audio and merging videos...", gr.update(choices=clip_choices, value=clip_choices[0] if clip_choices else None, visible=True), clip_mapping, results, descriptions, unique_labels, label_to_highlights, gr.update(choices=unique_labels, value=unique_labels[0] if unique_labels else None)
+        if generate_audio_commentary is None:
+            raise ImportError(
+                "Audio generation requires the Zonos package/module used by "
+                "`from zonos.sample import generate_audio_commentary`. "
+                "Install it on the server or disable Audio Generation in the UI."
+            ) from ZONOS_IMPORT_ERROR
+        for clip in clips:
+            result_key = _find_clip_key(results, clip["path"])
+            if result_key is None:
+                raise KeyError(f"No commentary text found for clip: {clip['path']}")
+            result_data = results[result_key]
+            commentary_payload = (
+                result_data.get("Timed Commentary")
+                if timed_commentary_enabled
+                else None
+            ) or result_data["Generated Commentary"]
+            generate_audio_commentary(clip["path"], commentary_payload, clip["label"])
+        merge_all_videos_with_audio(CLIPS_DIR=display_clip_dir, COMMENTARY_DIR=commentary_dir, OUTPUT_DIR=output_dir)
+
+    final_status = "✅ Generation complete! Select a highlight to view."
+    if not needs_descriptions and not generate_audio:
+        final_status = "✅ Clips ready. Select a highlight to view."
+    yield final_status, gr.update(choices=clip_choices, value=clip_choices[0] if clip_choices else None, visible=True), clip_mapping, results, descriptions, unique_labels, label_to_highlights, gr.update(choices=unique_labels, value=unique_labels[0] if unique_labels else None)
 
 def run_pipeline_with_mode(folder, video, mode,
                            video_prediction, clip_extraction, use_tracking,
                            generate_description, gen_commentary, generate_audio):
+    folder, video = _split_video_choice(folder, video)
     single_match = (mode == "Analyze specific extract")
     
     # Consomme le générateur pour récupérer le dernier yield
@@ -327,26 +641,35 @@ def display_highlight(clip_name, clip_mapping, results, descriptions):
         clip_name = clip_name[0]
     if not isinstance(clip_name, str):
         return None, None, "⚠️ Invalid selection.", "⚠️ Please select a highlight."
+    if clip_name in {"Choose a highlight", "No available highlight"}:
+        return None, None, "⚠️ Please select a highlight.", "⚠️ Please select a highlight."
     
     # Ensure `clip_mapping` is a dictionary
     if not isinstance(clip_mapping, dict):
         return None, None, "⚠️ Error: Clip mapping is missing.", "⚠️ Please select a highlight."
     
     # Retrieve the correct video path
-    if clip_name in clip_mapping:
-        video_path = clip_mapping[clip_name]
+    resolved_clip_name = _resolve_highlight_name(clip_name, clip_mapping)
+    if resolved_clip_name is not None:
+        video_path = clip_mapping[resolved_clip_name]
         video_path = video_path.replace("clips_tracked", "clips_commented")
         result_path = video_path.replace("clips_commented", "clips_tracked")
+        if not os.path.exists(result_path):
+            result_path = video_path.replace("clips_commented", "clips")
         print(f"video path : {video_path}, result path {result_path}")
-        result = results.get(result_path, {}).get("Generated Commentary", "ℹ️ No description available.")
-        description = descriptions[result_path]['description']
-        return result_path, video_path, result, description 
+        result_key = _find_clip_key(results, result_path) if isinstance(results, dict) else None
+        desc_key = _find_clip_key(descriptions, result_path) if isinstance(descriptions, dict) else None
+        result = results.get(result_key, {}).get("Generated Commentary", "ℹ️ No commentary available.") if result_key else "ℹ️ No commentary available."
+        description = descriptions.get(desc_key, {}).get("description", "ℹ️ No description available.") if desc_key else "ℹ️ No description available."
+        tracked_video = result_path if os.path.exists(result_path) else None
+        commented_video = video_path if os.path.exists(video_path) else None
+        return tracked_video, commented_video, result, description 
 
     return None, None, "❌ Selected highlight not found.", "❌ Selected highlight not found."
 
 def update_highlight_dropdown(selected_label, label_to_highlights):
     if not selected_label or selected_label not in label_to_highlights:
-        return gr.update(choices=["No available highlight"], value=None)
+        return gr.update(choices=[], value=None)
     choices = label_to_highlights[selected_label]
     return gr.update(choices=choices, value=choices[0] if choices else None)
 
@@ -365,13 +688,22 @@ def update_video_source(source):
 with gr.Blocks() as demo:
     gr.Markdown("# 🎥 AI-Powered Soccer Match Commentary")
 
-    folder_dropdown = gr.Dropdown(choices=list_folders(), label="📂 Select a folder")
+    initial_folders = list_folders()
+    initial_folder = initial_folders[0] if initial_folders else None
+    initial_videos = _all_video_choices()
+
+    folder_dropdown = gr.Dropdown(
+        choices=initial_folders,
+        value=initial_folder,
+        label="📂 Internal match folder",
+        visible=False,
+    )
 
     #################### CHOSE THE PARAMETERS ######################
     mode_radio = gr.Radio(
         choices=["Analyze specific extract", "Analyze full match (2 halves)"],
         label="🎯 Choose Analysis Mode",
-        value="Analyze specific extract"
+        value="Analyze full match (2 halves)"
     )
     gr.Markdown("Check the following boxes if you want to run the different steps or use the cached results to reduce inference time.")
     video_prediction_checkbox = gr.Checkbox(label="🎯 Run Action Spotting", value=True)
@@ -382,9 +714,13 @@ with gr.Blocks() as demo:
     generate_audio_checkbox = gr.Checkbox(label="🔊 Audio Generation", value=True)
 
     ########################### VIDEO SELECTION IF NEEDED ############################
-    video_dropdown = gr.Dropdown(label="🎥 Select a soccer match", choices=["No .mkv files available"]) #"Sélectionnez d'abord un dossier"
+    video_dropdown = gr.Dropdown(
+        label="🎥 Select a soccer match",
+        choices=initial_videos if initial_videos else ["No .mkv files available"],
+        value=initial_videos[0] if initial_videos else None,
+        visible=True,
+    )
     mode_radio.change(fn=toggle_video_dropdown, inputs=mode_radio, outputs=video_dropdown)
-    folder_dropdown.change(fn=list_videos_in_folder, inputs=folder_dropdown, outputs=video_dropdown)
 
     ###################### START GENERATION #######################
     start_button = gr.Button("🚀 Start Commentary Generation")
@@ -449,10 +785,13 @@ with gr.Blocks() as demo:
     #     outputs=[video_player_tracked, video_player_commented]
     # )
 
-    highlights_dropdown.change(lambda: gr.update(visible=True), outputs=highlights_dropdown)
-    highlights_dropdown.change(lambda: gr.update(visible=True), outputs=description_textbox)
-    highlights_dropdown.change(lambda: gr.update(visible=True), outputs=result_textbox)
+    highlights_dropdown.change(lambda *args: gr.update(visible=True), outputs=highlights_dropdown)
+    highlights_dropdown.change(lambda *args: gr.update(visible=True), outputs=description_textbox)
+    highlights_dropdown.change(lambda *args: gr.update(visible=True), outputs=result_textbox)
 
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=True)  # Modifier si besoin
+    server_name = os.environ.get("GRADIO_SERVER_NAME", "0.0.0.0")
+    server_port = int(os.environ.get("GRADIO_SERVER_PORT", "7860"))
+    share = os.environ.get("GRADIO_SHARE", "false").lower() in {"1", "true", "yes", "on"}
+    demo.launch(server_name=server_name, server_port=server_port, share=share)

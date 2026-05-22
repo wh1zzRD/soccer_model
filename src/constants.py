@@ -1,15 +1,18 @@
 """Constants for dataset soccer-net-v2"""
 
-from SoccerNet.utils import getListGames
+import os
 from pathlib import Path
 
-work_dir = Path("/usr/users/siapartnerscomsportif/bohin_ant/conv-model/")
-data_dir = work_dir / "data"
-configs_dir = work_dir / "configs"
+from SoccerNet.utils import getListGames
+
+project_root = Path(__file__).resolve().parents[1]
+work_dir = Path(os.environ.get("SOCCER_MODEL_WORK_DIR", project_root)).expanduser().resolve()
+data_dir = Path(os.environ.get("SOCCER_MODEL_DATA_DIR", work_dir / "data")).expanduser().resolve()
+configs_root_dir = Path(os.environ.get("SOCCER_MODEL_CONFIG_DIR", work_dir / "configs")).expanduser().resolve()
 soccernet_dir = data_dir / "soccernet"
 
 action_dir = data_dir / "action"
-configs_dir = configs_dir / "action"
+configs_dir = configs_root_dir / "action"
 experiments_dir = action_dir / "experiments"
 predictions_dir = action_dir / "predictions"
 visualizations_dir = action_dir / "visualizations"
@@ -126,7 +129,7 @@ num_classes = len(classes)
 target2class: dict[int, str] = {trg: cls for trg, cls in enumerate(classes)}
 class2target: dict[str, int] = {cls: trg for trg, cls in enumerate(classes)}
 
-num_halves = 2
+num_halves = int(os.environ.get("SOCCER_MODEL_NUM_HALVES", "2"))
 halves = list(range(1, num_halves + 1))
 postprocess_params = {
     "gauss_sigma": 3.0,

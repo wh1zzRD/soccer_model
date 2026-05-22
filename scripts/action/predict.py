@@ -9,7 +9,7 @@ import numpy as np
 from src.datasets.annotations import raw_predictions_to_actions, prepare_game_spotting_results
 from src.utils import get_best_model_path, get_video_info
 from src.evaluation.predictor import MultiDimStackerPredictor
-from src.data_processing.frame_fetchers.nvdec import NvDecFrameFetcher
+from src.data_processing.frame_fetchers.opencv import OpencvFrameFetcher as NvDecFrameFetcher
 #from src import constants
 
 
