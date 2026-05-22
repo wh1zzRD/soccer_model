@@ -59,6 +59,15 @@ def _clean_text(text: str) -> str:
     return text.strip()
 
 
+def _expand_short_goal_cue(text: str) -> str:
+    if "GOAL!" not in text.upper():
+        return text
+    words = text.strip(" .!-").split()
+    if len(words) <= 2:
+        return os.environ.get("SOCCER_MODEL_GOAL_FINAL_CUE", "It's in... GOAL!")
+    return text
+
+
 def _goal_reaction_enabled() -> bool:
     return os.environ.get("SOCCER_MODEL_USE_GOAL_REACTION", "0").lower() in {
         "1",
@@ -309,7 +318,7 @@ def _normalize_timed_cues(commentary) -> list[dict]:
             time_seconds = float(time_value)
         except (TypeError, ValueError):
             time_seconds = 0.0
-        text = _clean_text(str(text or ""))
+        text = _expand_short_goal_cue(_clean_text(str(text or "")))
         if text:
             cues.append({"time": max(0.0, time_seconds), "text": text})
     return cues
@@ -421,7 +430,7 @@ def _mix_timed_segments(output_wav: Path, clip_path: str, segments: list[dict]) 
     filter_parts = []
     mix_inputs = ["[0:a]"]
     normal_volume = os.environ.get("SOCCER_MODEL_TIMED_CUE_VOLUME", "1.25")
-    goal_volume = os.environ.get("SOCCER_MODEL_TIMED_GOAL_VOLUME", "2.2")
+    goal_volume = os.environ.get("SOCCER_MODEL_TIMED_GOAL_VOLUME", "3.0")
     for index, segment in enumerate(segments, start=1):
         delay_ms = max(0, int(float(segment["time"]) * 1000))
         volume = goal_volume if "GOAL!" in segment["text"].upper() else normal_volume

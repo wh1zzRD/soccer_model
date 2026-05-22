@@ -63,7 +63,8 @@ def _build_timed_commentary(commentary: str, action_label: str) -> list[dict]:
             cues.append({"time": max(0.4, goal_time - 3.4), "text": parts[0]})
             cues.append({"time": max(0.8, goal_time - 1.7), "text": parts[1]})
 
-        cues.append({"time": goal_time, "text": "GOAL!"})
+        final_goal_cue = os.environ.get("SOCCER_MODEL_GOAL_FINAL_CUE", "It's in... GOAL!")
+        cues.append({"time": goal_time, "text": final_goal_cue})
         return cues
 
     sentences = [

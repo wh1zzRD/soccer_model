@@ -35,9 +35,11 @@ export GRADIO_SHARE="${GRADIO_SHARE:-false}"
 default_crowd_audio="$PWD/crowd-cheering-clapping-at-stadium-gregor-quendel-1-00-30.mp3"
 if [[ -f "$default_crowd_audio" && "$(wc -c < "$default_crowd_audio")" -gt 1024 ]]; then
   export SOCCER_MODEL_CROWD_AUDIO="${SOCCER_MODEL_CROWD_AUDIO:-$default_crowd_audio}"
-  export SOCCER_MODEL_CROWD_VOLUME="${SOCCER_MODEL_CROWD_VOLUME:-0.14}"
+  export SOCCER_MODEL_CROWD_VOLUME="${SOCCER_MODEL_CROWD_VOLUME:-0.24}"
   export SOCCER_MODEL_CROWD_OFFSET="${SOCCER_MODEL_CROWD_OFFSET:-0.75}"
   export SOCCER_MODEL_COMMENTARY_VOLUME="${SOCCER_MODEL_COMMENTARY_VOLUME:-1.35}"
+  export SOCCER_MODEL_TIMED_GOAL_VOLUME="${SOCCER_MODEL_TIMED_GOAL_VOLUME:-3.0}"
+  export SOCCER_MODEL_GOAL_GAIN_DB="${SOCCER_MODEL_GOAL_GAIN_DB:-3.0}"
 fi
 
 python3 app.py
